@@ -1,18 +1,25 @@
 # model-usage — live omp usage in Tern's status line
 
-A Tern window plugin that adds one status-line segment showing omp's
-coding-plan quota for every authenticated account:
+A Tern window plugin that adds a status-line segment showing omp's
+coding-plan quota, as **percent remaining**, for every authenticated account:
 
 ```
-usage codex 5h 30% · opencode 7d 30% · cc 5h 8%
+antigravity 76% | codex 75% • 77%
+codex 46% (8%) • 23% (12%)
 ```
 
-Each provider shows the window it is closest to exhausting — `5h`, `7d` or
-`monthly`, whatever `omp usage --json` reports — with the id in front so the
-number is never ambiguous.
+- Each account shows its longest window (the 7d/weekly one) always.
+- The 5h window appears in parentheses only when less than 25% of it remains.
+- Several accounts of one provider are joined with `•`; identical reports
+  (Antigravity lists one per project) collapse into one.
+- Every number is its own status segment with its own colour, from white (all
+  left) to red (none left). Tern segments take a single `tone`, so the plugin
+  emits `data-tone="r0"`…`"r20"` and installs a matching stylesheet with
+  `tern.css`.
+- Antigravity's shared Claude & GPT windows are never shown.
 
 Clicking the segment (or `Model Usage: Details`) opens a **Model Usage** canvas
-pane: one card per provider, one line per quota window — name, percent, a
+pane: one card per provider, one line per quota window — name, percent left, a
 ten-block bar, reset countdown and status — kept in sync on each poll. The same
 pane is reused instead of opening a new one.
 
@@ -32,8 +39,7 @@ reload paints from that cache, so the segment and the pane fill in immediately
 instead of going blank until omp answers again.
 
 It polls `omp usage --json` on load and every 3 minutes (omp itself caches
-provider reports for ~5 minutes), writes the result into the segment, and tints
-it `warn` at 75% and `error` at 90% of the most constrained window.
+provider reports for ~5 minutes) and writes the result into the segment.
 
 ## Commands (palette, group "Model Usage")
 

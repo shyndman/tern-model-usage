@@ -16,149 +16,13 @@ local PROVIDER_LABELS = {
 	["google-antigravity"] = "antigravity",
 }
 
-local state = { text = nil, tone = nil, detail = nil, err = nil, raw = nil, canvasPane = nil }
+local state = { segments = nil, text = nil, detail = nil, err = nil, raw = nil, canvasPane = nil }
 local enabled = true
 local polling = false
 local lastPoll = nil
 
 local function providerLabel(id)
 	return PROVIDER_LABELS[id] or id
-end
-
--- User config lives in the plugin's data directory (next to kv.json), so it
--- survives reinstalling the plugin: <data>/config.json. Missing keys fall back
--- to the defaults below; a missing file is written with those defaults, and a
--- malformed one keeps the last good config and logs a warning.
-local SHOW_VALUES = { one = true, all = true }
-local PICK_VALUES = { max = true, min = true, first = true }
-
-local function defaultConfig()
-	return {
-		show = "one", -- one | all — one picked window per provider, or every matching window
-		pick = "max", -- max | min | first — how to pick when show = "one"
-		windows = {}, -- allowlist in display order; empty means every window omp reports
-		label = true, -- include the window id (5h, 7d, monthly) in the segment
-		exclude = {}, -- provider ids to leave out entirely
-		providers = {}, -- per-provider overrides of the keys above
-	}
-end
-
-local CONFIG_PATH = nil
-local config = defaultConfig()
-
-local function configPath()
-	if not CONFIG_PATH then
-		CONFIG_PATH = tern.plugin.data .. "/config.json"
-	end
-	return CONFIG_PATH
-end
-
-local function applyConfig(base, data)
-	local show = data.show
-	if show ~= nil then
-		if type(show) == "string" and SHOW_VALUES[show] then
-			base.show = show
-		else
-			tern.log.warn(string.format("model-usage: config.show = %s is not one|all", tostring(show)))
-		end
-	end
-	local pick = data.pick
-	if pick ~= nil then
-		if type(pick) == "string" and PICK_VALUES[pick] then
-			base.pick = pick
-		else
-			tern.log.warn(string.format("model-usage: config.pick = %s is not max|min|first", tostring(pick)))
-		end
-	end
-	if type(data.label) == "boolean" then
-		base.label = data.label
-	end
-	for _, key in ipairs({ "windows", "exclude" }) do
-		if type(data[key]) == "table" then
-			local list = {}
-			for _, item in ipairs(data[key]) do
-				if type(item) == "string" then
-					list[#list + 1] = item
-				end
-			end
-			base[key] = list
-		end
-	end
-	if type(data.providers) == "table" then
-		base.providers = data.providers
-	end
-	return base
-end
-
-local function loadConfig()
-	local path = configPath()
-	if not tern.fs.exists(path) then
-		pcall(tern.fs.write, path, tern.json.encode(defaultConfig(), true) .. "\n")
-		return defaultConfig(), nil
-	end
-	local okRead, text = pcall(tern.fs.read, path)
-	if not okRead then
-		return nil, "config.json is unreadable"
-	end
-	local okDecode, data = pcall(tern.json.decode, text)
-	if not okDecode or type(data) ~= "table" then
-		return nil, "config.json is not a JSON object"
-	end
-	return applyConfig(defaultConfig(), data), nil
-end
-
--- The effective keys for one provider: the global ones, overridden by its entry.
-local function providerConfig(provider)
-	local view = { show = config.show, pick = config.pick, windows = config.windows, label = config.label }
-	local override = config.providers[provider]
-	if type(override) == "table" then
-		applyConfig(view, override)
-	end
-	return view
-end
-
-local function inWindows(id, allow)
-	if #allow == 0 then
-		return true
-	end
-	if type(id) ~= "string" then
-		return false
-	end
-	local lower = id:lower()
-	for _, item in ipairs(allow) do
-		if item:lower() == lower then
-			return true
-		end
-	end
-	return false
-end
-
--- Candidates in the config's window order when an allowlist is set, else as reported.
-local function ordered(cands, allow)
-	if #allow == 0 then
-		return cands
-	end
-	local out = {}
-	for _, want in ipairs(allow) do
-		for _, cand in ipairs(cands) do
-			if cand.id and cand.id:lower() == want:lower() then
-				out[#out + 1] = cand
-			end
-		end
-	end
-	return out
-end
-
-local function pickOne(cands, pick)
-	local best = cands[1]
-	for _, cand in ipairs(cands) do
-		if pick == "min" and cand.used < best.used then
-			best = cand
-		elseif pick == "max" and cand.used > best.used then
-			best = cand
-		end
-	end
-	return best
 end
 
 local function kvGet(key)
@@ -187,77 +51,165 @@ local function formatReset(resetsAt, nowMs)
 	return string.format(", resets in %dm", mins)
 end
 
--- omp's UsageReport[] -> one status line plus a detail list. The most constrained
--- window per provider wins; providers are deduplicated across credentials.
+local HOUR_MS = 3600000
+local SHORT_WINDOW_SHOWN_BELOW = 0.25 -- the short (5h) window only appears under this much remaining
+
+local function usedFraction(limit)
+	local amount = limit.amount or {}
+	local used = amount.usedFraction
+	if type(used) ~= "number" then
+		used = (type(amount.used) == "number" and type(amount.limit) == "number" and amount.limit > 0)
+				and amount.used / amount.limit
+			or 0
+	end
+	return math.min(1, math.max(0, used))
+end
+
+local function windowMs(limit)
+	local window = limit.window or {}
+	if type(window.durationMs) == "number" then
+		return window.durationMs
+	end
+	local n, unit = tostring(window.id or ""):match("^(%d+)(%a)$")
+	if n then
+		return tonumber(n) * (unit == "d" and 24 * HOUR_MS or HOUR_MS)
+	end
+	return 0
+end
+
+-- Antigravity's Claude & GPT quota is shared and always shown as noise.
+local function hiddenLimit(report, limit)
+	if report.provider ~= "google-antigravity" then
+		return false
+	end
+	local id = tostring(limit.id or "")
+	local label = tostring(limit.label or "")
+	return id:find(":anthropic:", 1, true) ~= nil
+		or id:find(":openai:", 1, true) ~= nil
+		or label:find("Claude", 1, true) ~= nil
+		or label:find("GPT", 1, true) ~= nil
+end
+
+-- One entry per provider, in report order, each holding its accounts. A report is
+-- an account; reports that show the same windows (Antigravity lists one per
+-- project) collapse into one. An account's `long` window is its longest (7d) and
+-- `short` its shortest (5h), when that is a different window.
+local function collectAccounts(data)
+	local order, byProvider, seen = {}, {}, {}
+	for _, report in ipairs(data.reports or {}) do
+		local provider = report.provider or "?"
+		local windows, signature = {}, {}
+		for _, limit in ipairs(report.limits or {}) do
+			if not hiddenLimit(report, limit) then
+				local window = limit.window or {}
+				local w = {
+					used = usedFraction(limit),
+					ms = windowMs(limit),
+					id = window.id,
+					label = window.label or limit.label or "window",
+					resetsAt = window.resetsAt,
+					status = limit.status,
+					group = limit.label,
+				}
+				windows[#windows + 1] = w
+				signature[#signature + 1] = string.format("%s|%s|%s|%.4f", w.group or "", w.id or "", w.resetsAt or "", w.used)
+			end
+		end
+		if #windows > 0 then
+			local key = provider .. "\n" .. table.concat(signature, "\n")
+			if not seen[key] then
+				seen[key] = true
+				local long, short = windows[1], windows[1]
+				for _, w in ipairs(windows) do
+					if w.ms > long.ms or (w.ms == long.ms and w.used > long.used) then
+						long = w
+					end
+					if w.ms < short.ms or (w.ms == short.ms and w.used > short.used) then
+						short = w
+					end
+				end
+				if not byProvider[provider] then
+					byProvider[provider] = {}
+					order[#order + 1] = provider
+				end
+				local list = byProvider[provider]
+				list[#list + 1] = { windows = windows, long = long, short = short.ms < long.ms and short or nil }
+			end
+		end
+	end
+	return order, byProvider
+end
+
+-- White at full quota down to red at none, quantised so the stylesheet stays small.
+local TONE_STEPS = 20
+local RED = { 239, 68, 68 }
+
+local function remainingTone(used)
+	local remaining = 1 - used
+	return "r" .. math.floor(remaining * TONE_STEPS + 0.5)
+end
+
+local function toneCss()
+	local rules = {}
+	for step = 0, TONE_STEPS do
+		local t = step / TONE_STEPS
+		local rgb = {}
+		for i = 1, 3 do
+			rgb[i] = math.floor(RED[i] + (255 - RED[i]) * t + 0.5)
+		end
+		rules[#rules + 1] = string.format(
+			"#statusline .sl-plugin[data-plugin='model-usage'][data-tone='r%d'] { color: rgb(%d, %d, %d); }",
+			step,
+			rgb[1],
+			rgb[2],
+			rgb[3]
+		)
+	end
+	return table.concat(rules, "\n")
+end
+
+local function remainingPct(used)
+	return math.floor((1 - used) * 100 + 0.5)
+end
+
+-- omp's UsageReport[] -> status segments (each number with its own colour), the
+-- same as plain text for the log, and a one-line detail for the toast fallback.
 local function summarize(text)
 	local ok, data = pcall(tern.json.decode, text)
 	if not ok or type(data) ~= "table" then
 		return nil
 	end
-	local nowMs = data.generatedAt
-	local seen, order = {}, {}
-	local worst = 0
-	for _, report in ipairs(data.reports or {}) do
-		local provider = report.provider or "?"
-		local best
-		for _, limit in ipairs(report.limits or {}) do
-			local amount = limit.amount or {}
-			local used = amount.usedFraction
-			if type(used) ~= "number" then
-				used = (type(amount.used) == "number" and type(amount.limit) == "number" and amount.limit > 0)
-						and amount.used / amount.limit
-					or 0
-			end
-			if not best or used > best.used then
-				best = {
-					used = used,
-					id = limit.window and limit.window.id,
-					window = (limit.window and limit.window.label) or limit.label or "window",
-					resetsAt = limit.window and limit.window.resetsAt,
-					status = limit.status,
-				}
-			end
-		end
-		if best then
-			local entry = seen[provider]
-			if not entry then
-				entry = { best = best }
-				seen[provider] = entry
-				order[#order + 1] = provider
-			end
-			if best.used > entry.best.used then
-				entry.best = best
-			end
-		end
-	end
+	local order, byProvider = collectAccounts(data)
 	if #order == 0 then
 		return nil
 	end
-	local parts, details = {}, {}
-	for _, provider in ipairs(order) do
-		local best = seen[provider].best
-		local pct = math.floor(best.used * 100 + 0.5)
-		parts[#parts + 1] = best.id and string.format("%s %s %d%%", providerLabel(provider), best.id, pct)
-			or string.format("%s %d%%", providerLabel(provider), pct)
-		if best.used > worst then
-			worst = best.used
+	local segments, plain, details = {}, {}, {}
+	local command = "plugin.model-usage.details"
+	local function push(text, tone)
+		segments[#segments + 1] = { text = text, tone = tone, command = command }
+		plain[#plain + 1] = text
+	end
+	for index, provider in ipairs(order) do
+		if index > 1 then
+			push("|", "muted")
 		end
-		details[#details + 1] = string.format(
-			"%s: %s %d%% used%s%s",
-			provider,
-			best.window,
-			pct,
-			formatReset(best.resetsAt, nowMs),
-			best.status and best.status ~= "ok" and (" [" .. best.status .. "]") or ""
-		)
+		push(providerLabel(provider), nil)
+		local parts = {}
+		for n, account in ipairs(byProvider[provider]) do
+			if n > 1 then
+				push("•", "muted")
+			end
+			push(remainingPct(account.long.used) .. "%", remainingTone(account.long.used))
+			parts[#parts + 1] = remainingPct(account.long.used) .. "%"
+			local short = account.short
+			if short and 1 - short.used < SHORT_WINDOW_SHOWN_BELOW then
+				push("(" .. remainingPct(short.used) .. "%)", remainingTone(short.used))
+				parts[#parts] = parts[#parts] .. " (" .. remainingPct(short.used) .. "%)"
+			end
+		end
+		details[#details + 1] = providerLabel(provider) .. " " .. table.concat(parts, " • ") .. " left"
 	end
-	local tone
-	if worst >= 0.9 then
-		tone = "error"
-	elseif worst >= 0.75 then
-		tone = "warn"
-	end
-	return table.concat(parts, " · "), tone, table.concat(details, " · ")
+	return segments, table.concat(plain, " "), table.concat(details, " | ")
 end
 
 -- The last good report is cached in the plugin's data directory, trimmed to the
@@ -286,6 +238,7 @@ local function trimReport(text)
 			local amount = limit.amount or {}
 			local window = limit.window
 			limits[#limits + 1] = {
+				id = limit.id,
 				label = limit.label,
 				window = window and { id = window.id, label = window.label, resetsAt = window.resetsAt },
 				amount = {
@@ -322,11 +275,11 @@ local function restoreCache()
 	if not okDecode or type(data) ~= "table" or type(data.generatedAt) ~= "number" then
 		return false
 	end
-	local seg, tone, detail = summarize(text)
-	if not seg then
+	local segments, plain, detail = summarize(text)
+	if not segments then
 		return false
 	end
-	state.raw, state.text, state.tone, state.detail = text, seg, tone, detail
+	state.raw, state.segments, state.text, state.detail = text, segments, plain, detail
 	return true
 end
 
@@ -398,76 +351,48 @@ local function fetchUsage(cb)
 	attempt()
 end
 
--- Full multi-line usage breakdown: every window for every provider.
+-- Flattens collectAccounts into rows per provider; with several accounts the
+-- row name is prefixed "#n" so windows of different accounts stay apart.
+local function usageRows(data)
+	local order, byProvider = collectAccounts(data)
+	local rows = {}
+	for _, provider in ipairs(order) do
+		rows[provider] = {}
+		local accounts = byProvider[provider]
+		for n, account in ipairs(accounts) do
+			for _, w in ipairs(account.windows) do
+				local label = w.id and string.format("%s (%s)", w.label, w.id) or w.label
+				rows[provider][#rows[provider] + 1] = {
+					name = #accounts > 1 and string.format("#%d %s", n, label) or label,
+					used = w.used,
+					resetsAt = w.resetsAt,
+					status = w.status,
+				}
+			end
+		end
+	end
+	return order, rows
+end
+
+-- Full multi-line usage breakdown: every visible window for every provider.
 local function fullUsageText(text)
 	local ok, data = pcall(tern.json.decode, text)
 	if not ok or type(data) ~= "table" then
 		return nil
 	end
 	local nowMs = data.generatedAt
-	local seen, order = {}, {}
-	for _, report in ipairs(data.reports or {}) do
-		local provider = report.provider or "?"
-		if not seen[provider] then
-			seen[provider] = true
-			order[#order + 1] = provider
-		end
-	end
+	local order, rows = usageRows(data)
 	local lines = {}
 	for _, provider in ipairs(order) do
 		lines[#lines + 1] = providerLabel(provider) .. ":"
-		for _, report in ipairs(data.reports or {}) do
-			if report.provider == provider then
-				for _, limit in ipairs(report.limits or {}) do
-					local amount = limit.amount or {}
-					local used = amount.usedFraction
-					if type(used) ~= "number" then
-						used = (type(amount.used) == "number" and type(amount.limit) == "number" and amount.limit > 0)
-							and amount.used / amount.limit
-						or 0
-					end
-					local pct = math.floor(used * 100 + 0.5)
-					local label = (limit.window and limit.window.label) or limit.label or "window"
-					local reset = formatReset(limit.window and limit.window.resetsAt or nil, nowMs)
-					local status = limit.status and limit.status ~= "ok" and (" [" .. limit.status .. "]") or ""
-					lines[#lines + 1] = string.format("  %s: %d%% used%s%s", label, pct, reset, status)
-				end
-			end
+		for _, w in ipairs(rows[provider]) do
+			local status = w.status and w.status ~= "ok" and (" [" .. w.status .. "]") or ""
+			lines[#lines + 1] =
+				string.format("  %s: %d%% left%s%s", w.name, remainingPct(w.used), formatReset(w.resetsAt, nowMs), status)
 		end
 		lines[#lines + 1] = ""
 	end
 	return table.concat(lines, "\n")
-end
-
--- Collects (provider, window, used, resetsAt, status) rows from the raw report,
--- deduplicated per provider in report order.
-local function usageRows(data)
-	local seen, order, byProvider = {}, {}, {}
-	for _, report in ipairs(data.reports or {}) do
-		local provider = report.provider or "?"
-		if not seen[provider] then
-			seen[provider] = true
-			order[#order + 1] = provider
-			byProvider[provider] = {}
-		end
-		for _, limit in ipairs(report.limits or {}) do
-			local amount = limit.amount or {}
-			local used = amount.usedFraction
-			if type(used) ~= "number" then
-				used = (type(amount.used) == "number" and type(amount.limit) == "number" and amount.limit > 0)
-						and amount.used / amount.limit
-					or 0
-			end
-			byProvider[provider][#byProvider[provider] + 1] = {
-				label = (limit.window and limit.window.label) or limit.label or "window",
-				id = limit.window and limit.window.id,
-				used = used,
-				resetsAt = limit.window and limit.window.resetsAt,
-				status = limit.status,
-			}
-		end
-	end
-	return order, byProvider
 end
 
 -- A rich, persistent canvas view: one card per provider with a table row per
@@ -494,22 +419,22 @@ local function buildUsageView(text)
 	for _, provider in ipairs(order) do
 		local lines = {}
 		for _, w in ipairs(byProvider[provider]) do
-			local pct = math.floor(w.used * 100 + 0.5)
-			local name = w.id and string.format("%s (%s)", w.label, w.id) or w.label
+			local pct = remainingPct(w.used)
+			local name = w.name
 			local reset = formatReset(w.resetsAt, nowMs)
 			reset = (reset:gsub("^, ", ""))
 			local status = w.status or "ok"
-			-- Same thresholds the status line uses: warn at 75%, error at 90%.
+			-- Warn at 75% used, error at 90% used.
 			local pctTone
 			if w.used >= 0.9 then
 				pctTone = "error"
 			elseif w.used >= 0.75 then
 				pctTone = "warn"
 			end
-			local bar = math.min(10, math.max(0, math.floor(w.used * 10 + 0.5)))
+			local bar = math.min(10, math.max(0, math.floor((1 - w.used) * 10 + 0.5)))
 			lines[#lines + 1] = ui.text({
 				ui.span(name, "strong"),
-				ui.span(string.format("  %d%%  ", pct), pctTone),
+				ui.span(string.format("  %d%% left  ", pct), pctTone),
 				ui.span(string.rep("█", bar) .. string.rep("·", 10 - bar), pctTone or "muted"),
 				ui.span(reset ~= "" and ("  " .. reset) or "", "muted"),
 				ui.span("  " .. status, (w.status and w.status ~= "ok") and "error" or "muted"),
@@ -617,9 +542,9 @@ local function poll(cx, force)
 	fetchUsage(function(out, err, cx)
 		polling = false
 		if out then
-			local text, tone, detail = summarize(out)
-			if text then
-				state.text, state.tone, state.detail, state.err = text, tone, detail, nil
+			local segments, plain, detail = summarize(out)
+			if segments then
+				state.segments, state.text, state.detail, state.err = segments, plain, detail, nil
 				state.raw = out
 				saveCache(out)
 			else
@@ -660,17 +585,13 @@ if kvGet("enabled") == false then
 end
 
 tern.chrome.status(function(_pane)
-	if not enabled or not state.text then
+	if not enabled or not state.segments then
 		return nil
 	end
-	return {
-		{
-			text = "usage " .. state.text,
-			tone = state.tone,
-			command = "plugin.model-usage.details",
-		},
-	}
+	return state.segments
 end)
+
+tern.css("tones", toneCss())
 
 tern.command({
 	id = "refresh",
